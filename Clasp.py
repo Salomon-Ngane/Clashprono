@@ -1,275 +1,280 @@
-import logging
 import os
+import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from datetime import datetime, timedelta
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes,
+    ContextTypes
 )
 
-# Configuration du Logging
+# ==============================================================================
+# 1. SERVEUR HTTP FACTICE POUR RENDER (Correction de l'erreur Port Scan)
+# ==============================================================================
+
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    """Serveur HTTP minimaliste pour satisfaire les verifications de santé de Render."""
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(b"Bot Telegram en cours de fonctionnement sur Render !")
+
+    def log_message(self, format, *args):
+        # Desactive les logs HTTP pour ne pas encombrer la console Render
+        return
+
+def run_dummy_server():
+    """Lance le serveur HTTP dans un thread sur le port fourni par Render."""
+    port = int(os.environ.get("PORT", 8080))
+    server_address = ('', port)
+    httpd = HTTPServer(server_address, SimpleHTTPRequestHandler)
+    print(f"[Render Health Check] Serveur HTTP factice demarre sur le port {port}")
+    httpd.serve_forever()
+
+
+# ==============================================================================
+# 2. CONFIGURATION ET VARIABLES D'ENVIRONNEMENT
+# ==============================================================================
+
+# Verification et recuperation des clefs d'environnement
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "VOTRE_TELEGRAM_BOT_TOKEN")
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "VOTRE_CLE_API_ODDS")
+
+# Parametres de la strategie de paris
+MIN_ODD = 1.15
+MAX_ODD = 1.35
+HOURS_AHEAD = 48
+
+# Liste des sports/ligues supportes par TheOddsAPI
+SPORTS_TO_CHECK = [
+    "soccer_epl",
+    "soccer_france_ligue_1",
+    "soccer_spain_la_liga",
+    "soccer_italy_serie_a",
+    "soccer_germany_bundesliga",
+    "soccer_uefa_champs_league",
+    "basketball_nba",
+    "tennis_atp_wimbledon",
+    "tennis_us_open",
+    "mma_mixed_martial_arts"
+]
+
+# Logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
-# Clés d'API & Configuration (à configurer via Variables d'environnement sur Render/Heroku)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "VOTRE_TOKEN_TELEGRAM_ICI")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "VOTRE_CLE_API_ODDS_ICI")
-
-# Sports pris en charge par TheOddsAPI
-SPORTS_DISPONIBLES = {
-    "soccer_epl": "⚽ Football (EPL)",
-    "soccer_france_ligue_one": "⚽ Football (Ligue 1)",
-    "tennis_atp": "🎾 Tennis (ATP)",
-    "basketball_nba": "🏀 Basketball (NBA)",
-    "icehockey_nhl": "🏒 Hockey (NHL)",
-    "mma_mixed_martial_arts": "🥊 MMA",
-}
+# Stockage en memoire du ticket de l'utilisateur ({ user_id: [ selections ] })
+USER_TICKETS = {}
 
 
-# --- COMMANDES DE BASE ---
+# ==============================================================================
+# 3. FONCTIONS D'INTERACTION AVEC L'API THEODDSAPI
+# ==============================================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Message d'accueil expliquant le fonctionnement du bot."""
+def fetch_odds_for_sport(sport_key: str):
+    """Interroge l'API pour un sport specifique sur la fenetre de temps definie."""
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
+    params = {
+        'apiKey': ODDS_API_KEY,
+        'regions': 'eu',
+        'markets': 'h2h',
+        'oddsFormat': 'decimal'
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logging.error(f"Erreur API ({response.status_code}) pour le sport {sport_key}")
+            return []
+    except Exception as e:
+        logging.error(f"Exception lors de l'appel API pour {sport_key}: {e}")
+        return []
+
+
+def analyze_matches():
+    """Scanne les sports et filtre les matchs correspondant au critere (1.15 <= Cote <= 1.35)."""
+    qualified_matches = []
+    now = datetime.utcnow()
+    time_limit = now + timedelta(hours=HOURS_AHEAD)
+
+    for sport in SPORTS_TO_CHECK:
+        matches = fetch_odds_for_sport(sport)
+        for match in matches:
+            # Verification de la date du match
+            commence_time_str = match.get('commence_time')
+            if not commence_time_str:
+                continue
+            
+            commence_time = datetime.strptime(commence_time_str, "%Y-%m-%dT%H:%M:%SZ")
+            if not (now <= commence_time <= time_limit):
+                continue
+
+            bookmakers = match.get('bookmakers', [])
+            if not bookmakers:
+                continue
+
+            # Verification des cotes (Bookmaker 1)
+            outcomes = bookmakers[0].get('markets', [{}])[0].get('outcomes', [])
+            for outcome in outcomes:
+                price = outcome.get('price', 0)
+                if MIN_ODD <= price <= MAX_ODD:
+                    qualified_matches.append({
+                        'id': match.get('id'),
+                        'home_team': match.get('home_team'),
+                        'away_team': match.get('away_team'),
+                        'favorite': outcome.get('name'),
+                        'odd': price,
+                        'commence_time': commence_time.strftime("%d/%m à %H:%M UTC")
+                    })
+                    break  # Eviter les doublons pour un meme match
+
+    return qualified_matches
+
+
+# ==============================================================================
+# 4. COMMANDES ET HANDLERS DU BOT TELEGRAM
+# ==============================================================================
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /start : Accueil de l'utilisateur."""
     welcome_text = (
-        "👋 **Bienvenue sur le Bot de Paris Sportifs !**\n\n"
-        "Je vous aide à identifier les opportunités à fort taux de réussite (stratégie 80/20 avec des cotes entre 1.15 et 1.35).\n\n"
-        "📌 **Commandes disponibles :**\n"
-        "• `/analyser` : Choisissez vos sports et lancez la recherche sur 48h.\n"
-        "• `/ticket` : Consultez vos paris enregistrés dans le ticket du jour."
+        "👋 <b>Bienvenue sur votre Bot d'Analyse de Paris Sportifs !</b>\n\n"
+        "Ce bot recherche les opportunités basées sur la stratégie du favori "
+        f"(Cote située entre {MIN_ODD} et {MAX_ODD}).\n\n"
+        "📌 <b>Commandes disponibles :</b>\n"
+        "▫️ /analyser - Lancer l'analyse et choisir vos pronostics\n"
+        "▫️ /ticket - Voir et valider le ticket en cours\n"
+        "▫️ /vider - Effacer le ticket actuel"
     )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await update.message.reply_text(welcome_text, parse_mode="HTML")
 
 
-async def analyser_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Initialise le menu interactif de sélection des sports pour l'analyse."""
-    # Réinitialisation de la liste des sports temporaires pour l'utilisateur
-    context.user_data["sports_selectionnes"] = []
+async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /analyser : Recherche des matchs et generation des options de pari."""
+    await update.message.reply_text("🔍 <i>Analyse des matchs sur les prochaines 48h en cours... Veuillez patienter.</i>", parse_mode="HTML")
 
-    await afficher_menu_sports(update, context)
+    matches = analyze_matches()
+
+    if not matches:
+        await update.message.reply_text("❌ Aucun match correspondant aux critères de sélection n'a été trouvé pour le moment.")
+        return
+
+    await update.message.reply_text(f"📊 <b>{len(matches)} match(s) éligible(s) trouvé(s) !</b>\nFaites vos choix ci-dessous :", parse_mode="HTML")
+
+    for m in matches:
+        text = (
+            f"⚽ <b>{m['home_team']} vs {m['away_team']}</b>\n"
+            f"🕒 Date : {m['commence_time']}\n"
+            f"⭐ Favori identifié : <b>{m['favorite']}</b> (Cote : {m['odd']})"
+        )
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    f"Victoire Sèche ({m['favorite']}) @ {m['odd']}", 
+                    callback_data=f"add_{m['favorite']}_victoire_{m['odd']}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "Option Sécurisée (Chancedouble / Draw No Bet)", 
+                    callback_data=f"add_{m['favorite']}_securise_1.10"
+                )
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
 
-async def afficher_menu_sports(update: Update, context: ContextTypes.DEFAULT_TYPE, query=None) -> None:
-    """Génère le clavier interactif pour choisir les sports."""
-    sports_choisis = context.user_data.get("sports_selectionnes", [])
-
-    keyboard = []
-    for key, label in SPORTS_DISPONIBLES.items():
-        is_checked = key in sports_choisis
-        icon = "✅ " if is_checked else "⏹️ "
-        button_text = f"{icon}{label}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"toggle_{key}")])
-
-    # Boutons d'action
-    keyboard.append([
-        InlineKeyboardButton("🚀 Lancer l'Analyse", callback_data="valider_analyse")
-    ])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    msg_text = (
-        "🎯 **Étape 1 : Sélectionnez vos sports**\n"
-        "Cliquez sur les sports à inclure dans le scan 80/20, puis validez."
-    )
-
-    if query:
-        await query.edit_message_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode="Markdown")
-
-
-# --- GESTION DES BOUTONS INTERACTIFS ---
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Gère les clics sur les boutons (sélection des sports, pronostics, ticket)."""
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gere le clic de l'utilisateur sur les boutons interactifs."""
     query = update.callback_query
     await query.answer()
 
     data = query.data
-    user_data = context.user_data
+    user_id = query.from_user.id
 
-    # Mode par défaut : Initialisation de la sélection si inexistante
-    if "sports_selectionnes" not in user_data:
-        user_data["sports_selectionnes"] = []
+    if data.startswith("add_"):
+        parts = data.split("_")
+        team = parts[1]
+        option_type = parts[2]
+        odd = parts[3]
 
-    # 1. Gestion de la coche/décoche des sports
-    if data.startswith("toggle_"):
-        sport_key = data.replace("toggle_", "")
-        if sport_key in user_data["sports_selectionnes"]:
-            user_data["sports_selectionnes"].remove(sport_key)
-        else:
-            user_data["sports_selectionnes"].append(sport_key)
-        
-        await afficher_menu_sports(update, context, query=query)
+        if user_id not in USER_TICKETS:
+            USER_TICKETS[user_id] = []
 
-    # 2. Validation de l'analyse (Mode par défaut requis)
-    elif data == "valider_analyse":
-        sports_selectionnes = user_data.get("sports_selectionnes", [])
-        
-        # Blocage si aucun sport n'est sélectionné
-        if not sports_selectionnes:
-            await query.answer("⚠️ Veuillez sélectionner au moins 1 sport avant de lancer l'analyse.", show_alert=True)
-            return
+        selection = {
+            'team': team,
+            'type': option_type,
+            'odd': float(odd)
+        }
+        USER_TICKETS[user_id].append(selection)
 
-        await query.edit_message_text("🔎 **Analyse en cours...** Recherche des cotes comprises entre 1.15 et 1.35 sur les 48h à venir...")
-        await executer_analyse(query, context, sports_selectionnes)
-
-    # 3. Ajout au ticket de pari
-    elif data.startswith("pari_"):
-        details_pari = data.replace("pari_", "").split("|")
-        match, pronostic, cote = details_pari[0], details_pari[1], details_pari[2]
-
-        if "ticket" not in user_data:
-            user_data["ticket"] = []
-
-        user_data["ticket"].append({
-            "match": match,
-            "pronostic": pronostic,
-            "cote": float(cote)
-        })
-
-        await query.answer(f"✅ Pari ajouté au ticket ! ({pronostic} à {cote})", show_alert=True)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"✅ Ajouté au ticket : <b>{team}</b> ({option_type.capitalize()}) - Cote : {odd}", parse_mode="HTML")
 
 
-# --- MOTEUR D'ANALYSE & RÉCUPÉRATION DES COTES ---
-
-async def executer_analyse(query, context: ContextTypes.DEFAULT_TYPE, sports: list) -> None:
-    """Scanne les APIS pour les sports choisis et filtre selon le critère 80/20."""
-    resultats_trouves = 0
-
-    for sport_key in sports:
-        matchs_qualifies = verifier_opportunites_sport(sport_key)
-        
-        for match_data in matchs_qualifies:
-            resultats_trouves += 1
-            text_match = (
-                f"🏟️ **{match_data['sport']}** : {match_data['equipe1']} vs {match_data['equipe2']}\n"
-                f"⏰ Date/Heure : {match_data['date']}\n"
-                f"💡 **Analyse 80/20 :** Favori solide détecté !"
-            )
-
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        f"Direct: {match_data['favori']} ({match_data['cote_favori']})",
-                        callback_data=f"pari_{match_data['equipe1']} vs {match_data['equipe2']}|{match_data['favori']}|{match_data['cote_favori']}"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        f"Sécurisé: {match_data['choix_securise']} ({match_data['cote_securisee']})",
-                        callback_data=f"pari_{match_data['equipe1']} vs {match_data['equipe2']}|{match_data['choix_securise']}|{match_data['cote_securisee']}"
-                    )
-                ]
-            ]
-            markup = InlineKeyboardMarkup(keyboard)
-            await context.bot.send_message(chat_id=query.message.chat_id, text=text_match, reply_markup=markup, parse_mode="Markdown")
-
-    if resultats_trouves == 0:
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="❌ Aucune opportunité respectant la logique 80/20 (cote 1.15 - 1.35) n'a été trouvée pour les sports sélectionnés."
-        )
-
-
-def verifier_opportunites_sport(sport_key: str) -> list:
-    """
-    Interroge l'API (TheOddsAPI) pour récupérer les cotes et applique la logique 80/20.
-    """
-    # Remarque : si la clé API n'est pas renseignée, renvoie une structure de simulation
-    if ODDS_API_KEY == "VOTRE_CLE_API_ODDS_ICI":
-        return [
-            {
-                "sport": SPORTS_DISPONIBLES.get(sport_key, sport_key),
-                "equipe1": "Équipe A",
-                "equipe2": "Équipe B",
-                "date": (datetime.now() + timedelta(hours=12)).strftime("%d/%m %H:%M"),
-                "favori": "Équipe A",
-                "cote_favori": "1.25",
-                "choix_securise": "Victoire Équipe A ou Nul",
-                "cote_securisee": "1.08"
-            }
-        ]
-
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h"
-    matchs_qualifies = []
-
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            events = response.json()
-            for event in events:
-                # Filtrage sur les prochaines 48 heures
-                event_time = datetime.fromisoformat(event['commence_time'].replace('Z', '+00:00'))
-                if event_time > datetime.now().astimezone() + timedelta(hours=48):
-                    continue
-
-                bookmakers = event.get("bookmakers", [])
-                if not bookmakers:
-                    continue
-
-                outcomes = bookmakers[0]["markets"][0]["outcomes"]
-                for outcome in outcomes:
-                    cote = outcome.get("price", 0)
-                    # Filtre 80/20 strict : Cote entre 1.15 et 1.35
-                    if 1.15 <= cote <= 1.35:
-                        matchs_qualifies.append({
-                            "sport": SPORTS_DISPONIBLES.get(sport_key, sport_key),
-                            "equipe1": event.get("home_team"),
-                            "equipe2": event.get("away_team"),
-                            "date": event_time.strftime("%d/%m %H:%M"),
-                            "favori": outcome.get("name"),
-                            "cote_favori": str(cote),
-                            "choix_securise": f"Double Chance / Handicap {outcome.get('name')}",
-                            "cote_securisee": str(round(cote - 0.10, 2))
-                        })
-    except Exception as e:
-        logger.error(f"Erreur API pour {sport_key}: {e}")
-
-    return matchs_qualifies
-
-
-# --- GESTION DU TICKET DE PARI ---
-
-async def ticket_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Affiche le coupon combiné en cours d'assemblage."""
-    ticket = context.user_data.get("ticket", [])
+async def ticket_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /ticket : Affiche le coupon de pari compile."""
+    user_id = update.message.from_user.id
+    ticket = USER_TICKETS.get(user_id, [])
 
     if not ticket:
-        await update.message.reply_text("🎫 Votre ticket est vide pour le moment. Tapez `/analyser` pour ajouter des sélections.")
+        await update.message.reply_text("🎟️ Votre ticket est actuellement vide. Utilisez /analyser pour ajouter des matchs.")
         return
 
-    text = "🧾 **Votre Ticket Combiné du Jour :**\n\n"
-    cote_totale = 1.0
+    total_odd = 1.0
+    summary = "🎟️ <b>VOTRE TICKET COMBINÉ :</b>\n\n"
 
-    for idx, item in enumerate(ticket, start=1):
-        text += f"{idx}. {item['match']}\n   👉 Prono: *{item['pronostic']}* @ **{item['cote']}**\n"
-        cote_totale *= item["cote"]
+    for idx, item in enumerate(ticket, 1):
+        summary += f"{idx}. <b>{item['team']}</b> ({item['type'].capitalize()}) - Cote : {item['odd']}\n"
+        total_odd *= item['odd']
 
-    text += f"\n📊 **Cote Totale Combinée :** `{round(cote_totale, 2)}`"
-    
-    keyboard = [[InlineKeyboardButton("🗑️ Vider le Ticket", callback_data="vider_ticket")]]
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    summary += f"\n🔥 <b>Cote Totale Globale : {round(total_odd, 2)}</b>"
+    await update.message.reply_text(summary, parse_mode="HTML")
 
 
-# --- LANCEMENT DU BOT ---
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /vider : Reinitialise le ticket en cours."""
+    user_id = update.message.from_user.id
+    USER_TICKETS[user_id] = []
+    await update.message.reply_text("🗑️ Votre ticket a été réinitialisé.")
 
-def main() -> None:
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Handlers de commandes
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("analyser", analyser_command))
-    application.add_handler(CommandHandler("ticket", ticket_command))
+# ==============================================================================
+# 5. APPLICATION MAIN
+# ==============================================================================
 
-    # Handler pour les interactions sur les boutons
-    application.add_handler(CallbackQueryHandler(callback_handler))
+def main():
+    """Point d'entree principal de l'application."""
+    # 1. Demarrer le serveur Web factice dans un thread pour passer les checks Render
+    threading.Thread(target=run_dummy_server, daemon=True).start()
 
-    # Démarrage
-    application.run_polling()
+    # 2. Lancer le Bot Telegram
+    if TELEGRAM_BOT_TOKEN == "VOTRE_TELEGRAM_BOT_TOKEN":
+        logging.error("TELEGRAM_BOT_TOKEN non defini dans les variables d'environnement.")
+        return
+
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Enregistrement des commandes
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("analyser", analyze_command))
+    app.add_handler(CommandHandler("ticket", ticket_command))
+    app.add_handler(CommandHandler("vider", clear_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
+
+    print("🤖 Bot Telegram demarre et prêt a recevoir des commandes...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
