@@ -1,7 +1,7 @@
 import logging
 import os
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -23,6 +23,7 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "VOTRE_CLE_API_ODDS_ICI")
 # Paramètres de la stratégie 75/25
 MIN_ODD = 1.20
 MAX_ODD = 1.45
+FENETRE_HEURES = 48  # horizon de recherche des matchs
 
 # Sports pris en charge par TheOddsAPI
 SPORTS_DISPONIBLES = {
@@ -106,19 +107,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             user_data["sports_selectionnes"].remove(sport_key)
         else:
             user_data["sports_selectionnes"].append(sport_key)
-        
+
         await afficher_menu_sports(update, context, query=query)
 
-    # 2. Validation de l'analyse (Mode par défaut requis)
+    # 2. Validation de l'analyse
     elif data == "valider_analyse":
         sports_selectionnes = user_data.get("sports_selectionnes", [])
-        
+
         if not sports_selectionnes:
             await query.answer("⚠️ Veuillez sélectionner au moins 1 sport avant de lancer l'analyse.", show_alert=True)
             return
 
         await query.edit_message_text(
-            f"🔎 **Analyse en cours...** Recherche des cotes comprises entre {MIN_ODD} et {MAX_ODD} (Stratégie 75/25) sur les 48h à venir..."
+            f"🔎 **Analyse en cours...** Recherche des cotes comprises entre {MIN_ODD} et {MAX_ODD} (Stratégie 75/25) sur les {FENETRE_HEURES}h à venir..."
         )
         await executer_analyse(query, context, sports_selectionnes)
 
@@ -151,8 +152,12 @@ async def executer_analyse(query, context: ContextTypes.DEFAULT_TYPE, sports: li
     resultats_trouves = 0
 
     for sport_key in sports:
-        matchs_qualifies = verifier_opportunites_sport(sport_key)
-        
+        try:
+            matchs_qualifies = verifier_opportunites_sport(sport_key)
+        except Exception as e:
+            logger.error(f"Erreur inattendue pour {sport_key}: {e}")
+            continue
+
         for match_data in matchs_qualifies:
             resultats_trouves += 1
             text_match = (
@@ -188,6 +193,8 @@ async def executer_analyse(query, context: ContextTypes.DEFAULT_TYPE, sports: li
 def verifier_opportunites_sport(sport_key: str) -> list:
     """
     Interroge l'API (TheOddsAPI) pour récupérer les cotes et applique la logique 75/25.
+    Pour chaque match, on identifie le VRAI favori (cote h2h la plus basse) et on ne
+    retient que ceux dont la cote favorite tombe dans la fourchette 75/25.
     """
     if ODDS_API_KEY == "VOTRE_CLE_API_ODDS_ICI":
         return [
@@ -198,46 +205,116 @@ def verifier_opportunites_sport(sport_key: str) -> list:
                 "date": (datetime.now() + timedelta(hours=12)).strftime("%d/%m %H:%M"),
                 "favori": "Équipe A",
                 "cote_favori": "1.30",
-                "choix_securise": "Victoire Équipe A ou Nul",
+                "choix_securise": "Double Chance Équipe A ou Nul",
                 "cote_securisee": "1.10"
             }
         ]
 
-    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h"
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h,double_chance"
     matchs_qualifies = []
+    maintenant = datetime.now(timezone.utc)
+    limite = maintenant + timedelta(hours=FENETRE_HEURES)
 
     try:
         response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            events = response.json()
-            for event in events:
-                event_time = datetime.fromisoformat(event['commence_time'].replace('Z', '+00:00'))
-                if event_time > datetime.now().astimezone() + timedelta(hours=48):
-                    continue
+        if response.status_code != 200:
+            logger.error(f"TheOddsAPI a répondu {response.status_code} pour {sport_key}")
+            return matchs_qualifies
 
-                bookmakers = event.get("bookmakers", [])
-                if not bookmakers:
-                    continue
+        events = response.json()
 
-                outcomes = bookmakers[0]["markets"][0]["outcomes"]
-                for outcome in outcomes:
-                    cote = outcome.get("price", 0)
-                    # Filtre 75/25 strict : Cote entre MIN_ODD (1.20) et MAX_ODD (1.45)
-                    if MIN_ODD <= cote <= MAX_ODD:
-                        matchs_qualifies.append({
-                            "sport": SPORTS_DISPONIBLES.get(sport_key, sport_key),
-                            "equipe1": event.get("home_team"),
-                            "equipe2": event.get("away_team"),
-                            "date": event_time.strftime("%d/%m %H:%M"),
-                            "favori": outcome.get("name"),
-                            "cote_favori": str(cote),
-                            "choix_securise": f"Double Chance / Handicap {outcome.get('name')}",
-                            "cote_securisee": str(round(cote - 0.12, 2))
-                        })
+        for event in events:
+            try:
+                event_time = datetime.fromisoformat(event["commence_time"].replace("Z", "+00:00"))
+            except (KeyError, ValueError):
+                continue
+
+            # On ne garde que les matchs à venir, dans la fenêtre définie
+            if event_time < maintenant or event_time > limite:
+                continue
+
+            bookmakers = event.get("bookmakers", [])
+            if not bookmakers:
+                continue
+
+            favori = extraire_favori_h2h(bookmakers)
+            if favori is None:
+                continue
+
+            nom_favori, cote_favori = favori
+            if not (MIN_ODD <= cote_favori <= MAX_ODD):
+                continue
+
+            cote_securisee = extraire_cote_double_chance(bookmakers, nom_favori)
+
+            matchs_qualifies.append({
+                "sport": SPORTS_DISPONIBLES.get(sport_key, sport_key),
+                "equipe1": event.get("home_team"),
+                "equipe2": event.get("away_team"),
+                "date": event_time.astimezone().strftime("%d/%m %H:%M"),
+                "favori": nom_favori,
+                "cote_favori": str(cote_favori),
+                "choix_securise": f"Double Chance {nom_favori}",
+                "cote_securisee": str(cote_securisee) if cote_securisee else "N/A",
+            })
+
+    except requests.RequestException as e:
+        logger.error(f"Erreur réseau API pour {sport_key}: {e}")
     except Exception as e:
-        logger.error(f"Erreur API pour {sport_key}: {e}")
+        logger.error(f"Erreur inattendue lors du parsing pour {sport_key}: {e}")
 
     return matchs_qualifies
+
+
+def extraire_favori_h2h(bookmakers: list):
+    """
+    Calcule la cote moyenne par équipe/issue sur tous les bookmakers disposant
+    d'un marché h2h, puis retourne (nom, cote_moyenne_arrondie) de la cote la plus basse.
+    Retourne None si aucune donnée exploitable.
+    """
+    cotes_par_issue = {}
+
+    for bk in bookmakers:
+        for marche in bk.get("markets", []):
+            if marche.get("key") != "h2h":
+                continue
+            for outcome in marche.get("outcomes", []):
+                nom = outcome.get("name")
+                prix = outcome.get("price")
+                if nom is None or prix is None:
+                    continue
+                cotes_par_issue.setdefault(nom, []).append(prix)
+
+    if not cotes_par_issue:
+        return None
+
+    moyennes = {nom: sum(prix_list) / len(prix_list) for nom, prix_list in cotes_par_issue.items()}
+    nom_favori = min(moyennes, key=moyennes.get)
+    return nom_favori, round(moyennes[nom_favori], 2)
+
+
+def extraire_cote_double_chance(bookmakers: list, nom_favori: str):
+    """
+    Cherche une vraie cote de marché 'double_chance' correspondant au favori.
+    Retourne None si le marché n'est pas disponible (l'appelant affichera 'N/A').
+    """
+    cotes = []
+    for bk in bookmakers:
+        for marche in bk.get("markets", []):
+            if marche.get("key") != "double_chance":
+                continue
+            for outcome in marche.get("outcomes", []):
+                nom = outcome.get("name", "")
+                prix = outcome.get("price")
+                if prix is None:
+                    continue
+                # Le nom du marché double chance inclut généralement le favori (ex: "Team A or Draw")
+                if nom_favori in nom:
+                    cotes.append(prix)
+
+    if not cotes:
+        return None
+    return round(sum(cotes) / len(cotes), 2)
 
 
 # --- GESTION DU TICKET DE PARI ---
@@ -258,7 +335,7 @@ async def ticket_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cote_totale *= item["cote"]
 
     text += f"\n📊 **Cote Totale Combinée :** `{round(cote_totale, 2)}`"
-    
+
     keyboard = [[InlineKeyboardButton("🗑️ Vider le Ticket", callback_data="vider_ticket")]]
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
