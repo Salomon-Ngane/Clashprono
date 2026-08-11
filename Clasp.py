@@ -1,7 +1,9 @@
 import logging
 import os
+import threading
 import requests
 from datetime import datetime, timedelta, timezone
+from flask import Flask
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -340,9 +342,31 @@ async def ticket_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
+# --- SERVEUR WEB FACTICE (pour satisfaire le health check de Render) ---
+
+web_app = Flask(__name__)
+
+
+@web_app.route("/")
+def health_check():
+    """Route unique pour répondre aux health checks de Render (ou autre PaaS)."""
+    return "Clashprono bot en ligne.", 200
+
+
+def lancer_serveur_web() -> None:
+    """Démarre Flask dans un thread séparé, sur le port fourni par Render."""
+    port = int(os.getenv("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
+
+
 # --- LANCEMENT DU BOT ---
 
 def main() -> None:
+    # Le serveur Flask tourne en arrière-plan (daemon) pendant que le bot fait
+    # son polling Telegram sur le thread principal.
+    thread_web = threading.Thread(target=lancer_serveur_web, daemon=True)
+    thread_web.start()
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
