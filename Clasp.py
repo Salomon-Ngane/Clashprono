@@ -2,6 +2,8 @@ import logging
 import os
 import time
 import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, date
 
 import requests
@@ -39,6 +41,11 @@ MAX_SPORT_KEYS_PAR_ANALYSE = int(os.getenv("ODDS_API_MAX_CALLS_PER_ANALYSE", "15
 
 # Mots-clés utilisés pour repérer le bookmaker de référence dans la liste renvoyée par l'API
 BOOKMAKER_PREFERE_MOTS_CLES = ["1xbet", "onexbet", "one x bet"]
+
+# Port fourni par Render pour son scan de port (obligatoire sur un "Web Service").
+# Le bot Telegram fonctionne en polling et n'a pas besoin de ce port pour lui-même :
+# on ouvre juste un petit serveur HTTP factice pour satisfaire Render.
+PORT_KEEPALIVE = int(os.getenv("PORT", "10000"))
 
 # Mappage : sport affiché à l'utilisateur -> "group" tel que renvoyé par /v4/sports
 SPORTS_DISPONIBLES = {
@@ -422,9 +429,34 @@ async def ticket_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
+# --- SERVEUR HTTP FACTICE (keep-alive Render) ---
+
+class _HandlerKeepAlive(BaseHTTPRequestHandler):
+    """Répond OK à toute requête, juste pour que Render détecte un port ouvert."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Clashprono bot actif (mode polling Telegram).")
+
+    def log_message(self, format, *args):
+        pass  # on coupe les logs HTTP verbeux, les logs du bot suffisent
+
+
+def demarrer_serveur_keepalive() -> None:
+    """Lance le serveur HTTP factice dans un thread daemon séparé."""
+    serveur = HTTPServer(("0.0.0.0", PORT_KEEPALIVE), _HandlerKeepAlive)
+    thread = threading.Thread(target=serveur.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Serveur HTTP de keep-alive démarré sur le port {PORT_KEEPALIVE} (pour Render).")
+
+
 # --- DÉMARRAGE BOT ---
 
 def main() -> None:
+    demarrer_serveur_keepalive()
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -438,4 +470,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
